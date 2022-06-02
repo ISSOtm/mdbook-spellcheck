@@ -109,7 +109,7 @@ impl Renderer for SpellChecker {
                 .map(|value| {
                     value.as_table().ok_or_else(|| {
                         Error::msg(format!(
-                            "`output.renderer.{}.rules` in config should be a table, not {}",
+                            "`output.{}.rules` in config should be a table, not {}",
                             self.name(),
                             value.type_str()
                         ))
@@ -135,7 +135,7 @@ impl Renderer for SpellChecker {
         let mut output = StandardStream::stderr(auto_color(atty::Stream::Stderr));
         let config = term::Config::default();
 
-        let mut scribe = SuggestionScribe::new(&mut output, &config);
+        let mut scribe = SuggestionScribe::new(&mut output, &config, &rules_config);
 
         // Set up SUMMARY.md book structure iterator
         let mut summary_path = ctx.root.join(&ctx.config.book.src);
@@ -242,13 +242,25 @@ impl Renderer for SpellChecker {
                     // For each "block", build a representation of its text, and spell-check that
                     let mut txt = String::new();
                     let mut offsets = Vec::new();
-                    let mut events = Parser::new(&chapter.content).into_offset_iter();
+                    let mut events = Parser::new(&chapter.content).into_offset_iter().peekable();
                     while let Some((evt, span)) = events.next() {
                         match evt {
                             Event::Start(Tag::List(_)) => (), // Ignore lists, we care about the items within
                             Event::End(Tag::List(_)) => (), // Consequently, ignore their endings as well
 
                             Event::Start(tag) if !is_inline(&tag) => {
+                                // List items may contain a paragraph if they are "loose", i.e.
+                                // they are separated by blank lines; this generates a paragraph
+                                // inside the list item.
+                                // FIXME: List items can actually contain blocks, so we need an entire refactor
+                                let contains_para =matches!(events.peek(),Some((Event::Start(Tag::Paragraph), _)));
+                                if contains_para {
+                                    events.next(); // Skip that paragraph start
+                                }
+
+                                txt.clear();
+                                offsets.clear();
+
                                 let ending_tag =
                                     get_block_text(
                                         &mut events, &mut txt, &mut offsets, lang, |title, span| {
@@ -268,10 +280,15 @@ impl Renderer for SpellChecker {
                                             });
                                         })
                                     .context(format!(
-                                        "Error within block {:?} (start @ {:#x}..{:#x})",
-                                        tag, span.start,span.end))
+                                        "Error within block {:?} (\"{}\")",
+                                        tag, &chapter.content[span]))
                                     .context(format!("Failed to parse chapter \"{}\"", chapter.name))?;
-                                assert_eq!(ending_tag, tag);
+                                if contains_para {
+                                    assert_eq!(ending_tag, Tag::Paragraph);
+                                    assert_eq!(events.next().map(|t|t.0), Some(Event::End(tag.clone())));
+                                } else {
+                                    assert_eq!(ending_tag, tag);
+                                }
 
                                 match tag {
                                     // Do not spell check code block contents, unless explicitly
@@ -299,8 +316,6 @@ impl Renderer for SpellChecker {
                                             }
                                         });
 
-                                        txt.clear();
-                                        offsets.clear();
                                     }
                                 }
                             }
@@ -364,6 +379,7 @@ impl Renderer for SpellChecker {
             }
         }
 
+        // TODO: keep track of errors separately, and error out if any
         if scribe.nb_reports() != 0 {
             eprintln!("Found {} spell checking reports", scribe.nb_reports());
         }
@@ -420,8 +436,8 @@ fn title_span(mut span: Range<usize>, text: &str) -> Range<usize> {
 
 /// Computes a text-only representation of a markdown block, keeping track of the mappings as it goes.
 /// The tag returned is the ending block's.
-fn get_block_text<'a>(
-    events: &mut OffsetIter<'a>,
+fn get_block_text<'a, I: Iterator<Item = (Event<'a>, Range<usize>)>>(
+    events: &mut I,
     text: &mut String,
     mappings: &mut Vec<StringMapping>,
     lang: &str,
@@ -491,16 +507,22 @@ fn get_block_text<'a>(
 struct SuggestionScribe<'a> {
     output: &'a mut StandardStream,
     config: &'a Config,
+    rules_config: &'a RulesConfig<'a>,
 
     nb_reports: usize,
 }
 
 impl<'a> SuggestionScribe<'a> {
     /// Creates a new scribe, writing to the given stream and with the given configuration.
-    fn new(output: &'a mut StandardStream, config: &'a Config) -> Self {
+    fn new(
+        output: &'a mut StandardStream,
+        config: &'a Config,
+        rules_config: &'a RulesConfig<'a>,
+    ) -> Self {
         Self {
             output,
             config,
+            rules_config,
 
             nb_reports: 0,
         }
@@ -515,19 +537,24 @@ impl<'a> SuggestionScribe<'a> {
         files: &SimpleFile<Name, Source>,
         span: Range<usize>,
     ) {
-        // TODO: more fine-grained diagnostic types & control
-        let diagnostic = Diagnostic::warning()
-            .with_code(suggestion.source())
-            .with_message(suggestion.message())
-            // `()` being [`SimpleFile`]'s [`FileId`][codespan_reporting::files::Files]
-            .with_labels(vec![Label::primary((), span)])
-            .with_notes(
-                suggestion
-                    .replacements()
-                    .iter()
-                    .map(|repl| format!("help: consider replacing it with `{}`", repl))
-                    .collect(),
-            );
+        let severity: Option<_> = self.rules_config.get(suggestion.source()).into();
+        let diagnostic = Diagnostic::new(severity.unwrap_or_else(|| {
+            panic!(
+                "Rule {} is disabled, but still produced a diagnostic",
+                suggestion.source()
+            )
+        }))
+        .with_code(suggestion.source())
+        .with_message(suggestion.message())
+        // `()` being [`SimpleFile`]'s [`FileId`][codespan_reporting::files::Files]
+        .with_labels(vec![Label::primary((), span)])
+        .with_notes(
+            suggestion
+                .replacements()
+                .iter()
+                .map(|repl| format!("help: consider replacing it with `{}`", repl))
+                .collect(),
+        );
 
         term::emit(&mut self.output.lock(), self.config, files, &diagnostic).unwrap();
         self.nb_reports += 1;
@@ -600,8 +627,17 @@ struct RulesConfig<'a>(HashMap<&'a str, DiagnosticLevel>);
 impl<'a> RulesConfig<'a> {
     // WARNING: This will misbehave if there is "overlap", i.e. a generic rule and a more specific
     // rule covered by it!!
+    // TODO: these are english rules... add different configuration per language!
     const DEFAULT_CONFIG: &'static [(&'static str, DiagnosticLevel)] = &[
         ("TYPOGRAPHY/EN_QUOTES", DiagnosticLevel::Off), // mdBook automatically generates smart quotes, so hush.
+        // Mark typography requirements involving Unicode chars as simple notes
+        ("TYPOGRAPHY/ARROWS", DiagnosticLevel::Note),
+        ("TYPOGRAPHY/MULTIPLICATION_SIGN/0", DiagnosticLevel::Note),
+        ("TYPOGRAPHY/TRADEMARK/0", DiagnosticLevel::Note),
+        ("TYPOGRAPHY/R_SYMBOL/0", DiagnosticLevel::Note),
+        ("PUNCTUATION/DASH_RULE", DiagnosticLevel::Note),
+        ("TYPOGRAPHY/PLUS_MINUS/0", DiagnosticLevel::Note),
+        ("TYPOGRAPHY/PLUS_MINUS/1", DiagnosticLevel::Note),
         // LanguageTool has those disabled by default
         // TODO: Auto-generate those
         // Note: more general rules are preferred when applicable, for easier cherry-picking,
@@ -700,7 +736,8 @@ impl<'a> RulesConfig<'a> {
                     let mut end = name.len();
                     loop {
                         // Is the rule covered, either directly or by a wider rule?
-                        // (Note that this assumes that there is no overlap on the default rules)
+                        // (Note that this assumes that no two default rules overlap, since HashMap
+                        // can and will scramble insertion order)
                         if config.get(&name[..end]).is_some() {
                             break;
                         }
@@ -926,6 +963,8 @@ fn parse_summary<'a>(
     summary: &'a str,
     mut get_block_text: impl FnMut(&mut OffsetIter<'a>) -> Result<(String, Vec<StringMapping>, Tag<'a>)>,
 ) -> Result<Vec<SummaryItem>> {
+    use SummaryLocsState::*;
+
     // This parsing process attempts to mimic the way `mdbook` itself parses `SUMMARY.md`.
     // *Obviously*, there will likely be discrepancies, as `mdbook` is more lax than its spec,
     // but any sanely-written summaries should work regardless.
@@ -935,12 +974,12 @@ fn parse_summary<'a>(
     // Please note that this behavior was not RE'd from the mdbook code, but deduced by feeding
     // it various input files.
     let mut events = Parser::new(summary).into_offset_iter();
-    let mut state = SummaryLocsState::Prefix;
+    let mut state = Prefix;
     let mut items = Vec::new();
 
     while let Some((evt, _)) = events.next() {
         match state {
-            SummaryLocsState::Prefix => {
+            Prefix => {
                 // For prefix chapters, mdBook parses every link as a chapter, and ignores the rest
                 if let Event::Start(Tag::Link(ty, url, ti)) = evt {
                     let (name, mappings, ending_tag) = get_block_text(&mut events).context(
@@ -958,16 +997,16 @@ fn parse_summary<'a>(
 
                     items.push(SummaryItem::Part(name, mappings));
 
-                    state = SummaryLocsState::AfterHeader;
+                    state = AfterHeader;
                 }
             }
 
             // Then, after each header, mdBook ignores everything up until the first list
             // TODO: is the list's type ignored?
-            SummaryLocsState::AfterHeader => {
+            AfterHeader => {
                 // Every list item is processed, regardless of whether part of a single list or several (separated via HTML comments)
                 if let Event::Start(Tag::List(_)) = evt {
-                    state = SummaryLocsState::Normal;
+                    state = Normal(0);
                 }
                 // If the last list is followed by a heading, process the next part
                 else if let Event::Start(Tag::Heading(1)) = evt {
@@ -981,11 +1020,11 @@ fn parse_summary<'a>(
                 else {
                     items.push(SummaryItem::SuffixPart);
 
-                    state = SummaryLocsState::Suffix;
+                    state = Suffix;
                 }
             }
 
-            SummaryLocsState::Normal => {
+            Normal(depth) => {
                 if let Event::Start(Tag::Item) = evt {
                     // Each item must start with a link...
                     let tag = match events.next() {
@@ -999,28 +1038,35 @@ fn parse_summary<'a>(
 
                     items.push(SummaryItem::Chapter(name, mappings));
 
-                    // ...anything after that is ignored
-                    let mut depth = 0;
+                    // ...anything after that is ignored, up to the end of the item, or the
+                    // beginning of a sub-list
                     // We can't use `for` because it consumes the iterator
                     #[allow(clippy::while_let_on_iterator)]
                     while let Some((evt, _)) = events.next() {
                         match evt {
-                            Event::End(Tag::Item) => {
-                                if depth == 0 {
-                                    break;
-                                }
-                                depth -= 1;
+                            Event::End(Tag::Item) => break,
+                            Event::Start(Tag::Item) => unreachable!(),
+                            Event::Start(Tag::List(_)) => {
+                                state = Normal(depth + 1);
+                                break;
                             }
-                            Event::Start(Tag::Item) => depth += 1,
                             _ => (),
                         }
                     }
-                } else if let Event::End(Tag::List(_)) = evt {
-                    state = SummaryLocsState::AfterHeader;
+                }
+                // Track list depth
+                else if let Event::End(Tag::List(_)) = evt {
+                    state = if depth == 0 {
+                        AfterHeader
+                    } else {
+                        Normal(depth - 1)
+                    };
+                } else if let Event::Start(Tag::List(_)) = evt {
+                    state = Normal(depth + 1);
                 }
             }
 
-            SummaryLocsState::Suffix => {
+            Suffix => {
                 if let Event::Start(Tag::Link(ty, url, ti)) = evt {
                     let (name, mappings, ending_tag) = get_block_text(&mut events).context(
                         format!("Error within {:?} link to {} (title {})", ty, url, ti),
@@ -1042,6 +1088,6 @@ fn parse_summary<'a>(
 enum SummaryLocsState {
     Prefix,
     AfterHeader,
-    Normal,
+    Normal(usize),
     Suffix,
 }
